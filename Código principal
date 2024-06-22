@@ -1,0 +1,271 @@
+import keras_nlp
+import pathlib
+import random
+import os
+
+import keras
+from keras import ops
+import tensorflow as tf
+import tensorflow.data as tf_data
+from tensorflow_text.tools.wordpiece_vocab import (
+    bert_vocab_from_dataset as bert_vocab,
+)
+
+# Hiperparámetros
+BATCH_SIZE = 64
+EPOCHS = 20  # Este valor debería ser mayor para una mejor convergencia
+MAX_SEQUENCE_LENGTH = 40
+VOCAB_SIZE = 15000
+EMBED_DIM = 256
+INTERMEDIATE_DIM = 2048
+NUM_HEADS = 8
+
+# Función para leer y procesar archivos de texto
+def read_text_pairs(file_path1, file_path2):
+    with open(file_path1, encoding='utf-8') as f1, open(file_path2, encoding='utf-8') as f2:
+        lines1 = f1.read().split("\n")[:-1]
+        lines2 = f2.read().split("\n")[:-1]
+    text_pairs = [(line1.lower(), line2.lower()) for line1, line2 in zip(lines1, lines2)]
+    return text_pairs
+
+# Leer los archivos
+files = [
+('/content/drive/MyDrive/Base de datos  lenguaje indigena/dev ashanika.cni', '/content/drive/MyDrive/Base de datos  lenguaje indigena/dev ashanikaespañol.es'),
+    ('/content/drive/MyDrive/Base de datos  lenguaje indigena/devaymara.aym', '/content/drive/MyDrive/Base de datos  lenguaje indigena/dev aymaraespañol.es'),
+    ('/content/drive/MyDrive/Base de datos  lenguaje indigena/dev bibri.bzd', '/content/drive/MyDrive/Base de datos  lenguaje indigena/dev bibriespa.es'),
+    ('/content/drive/MyDrive/Base de datos  lenguaje indigena/dev shipibo.shp', '/content/drive/MyDrive/Base de datos  lenguaje indigena/dev españolshipibo .es'),
+    ('/content/drive/MyDrive/Base de datos  lenguaje indigena/dev.hch', '/content/drive/MyDrive/Base de datos  lenguaje indigena/devhch.es'),
+    ('/content/drive/MyDrive/Base de datos  lenguaje indigena/devguarani.gn', '/content/drive/MyDrive/Base de datos  lenguaje indigena/dev espanolguarani.es')
+
+]
+
+
+text_pairs_list = []
+for file_pair in files:
+    text_pairs_list.extend(read_text_pairs(*file_pair))
+
+# Dividir en conjuntos de entrenamiento, validación y prueba
+random.shuffle(text_pairs_list)
+num_val_samples = int(0.15 * len(text_pairs_list))
+num_train_samples = len(text_pairs_list) - 2 * num_val_samples
+train_pairs = text_pairs_list[:num_train_samples]
+val_pairs = text_pairs_list[num_train_samples : num_train_samples + num_val_samples]
+test_pairs = text_pairs_list[num_train_samples + num_val_samples :]
+
+# Tokenización y preprocesamiento
+reserved_tokens = ["[PAD]", "[UNK]", "[START]", "[END]"]
+
+def train_word_piece(text_samples, vocab_size, reserved_tokens):
+    word_piece_ds = tf_data.Dataset.from_tensor_slices(text_samples)
+    vocab = keras_nlp.tokenizers.compute_word_piece_vocabulary(
+        word_piece_ds.batch(1000).prefetch(2),
+        vocabulary_size=vocab_size,
+        reserved_tokens=reserved_tokens,
+    )
+    return vocab
+
+src_samples = [pair[0] for pair in train_pairs]
+tgt_samples = [pair[1] for pair in train_pairs]
+src_vocab = train_word_piece(src_samples, VOCAB_SIZE, reserved_tokens)
+tgt_vocab = train_word_piece(tgt_samples, VOCAB_SIZE, reserved_tokens)
+
+src_tokenizer = keras_nlp.tokenizers.WordPieceTokenizer(
+    vocabulary=src_vocab, lowercase=False
+)
+tgt_tokenizer = keras_nlp.tokenizers.WordPieceTokenizer(
+    vocabulary=tgt_vocab, lowercase=False
+)
+
+def preprocess_batch(src, tgt):
+    # Tokenización de las entradas
+    src = src_tokenizer(src)
+    tgt = tgt_tokenizer(tgt)
+
+    src_packer = keras_nlp.layers.StartEndPacker(
+        sequence_length=MAX_SEQUENCE_LENGTH,
+        pad_value=src_tokenizer.token_to_id("[PAD]"),
+    )
+    src = src_packer(src)
+
+    tgt_packer = keras_nlp.layers.StartEndPacker(
+        sequence_length=MAX_SEQUENCE_LENGTH + 1,
+        start_value=tgt_tokenizer.token_to_id("[START]"),
+        end_value=tgt_tokenizer.token_to_id("[END]"),
+        pad_value=tgt_tokenizer.token_to_id("[PAD]"),
+    )
+    tgt = tgt_packer(tgt)
+
+    return (
+        {
+            "encoder_inputs": src,
+            "decoder_inputs": tgt[:, :-1],
+        },
+        tgt[:, 1:],
+    )
+
+def make_dataset(pairs):
+    src_texts, tgt_texts = zip(*pairs)
+    dataset = tf_data.Dataset.from_tensor_slices((list(src_texts), list(tgt_texts)))
+    dataset = dataset.map(lambda src, tgt: (tf.strings.lower(src), tf.strings.lower(tgt)), num_parallel_calls=tf_data.AUTOTUNE)
+    dataset = dataset.batch(BATCH_SIZE)
+    dataset = dataset.map(preprocess_batch, num_parallel_calls=tf_data.AUTOTUNE)
+    return dataset.shuffle(2048).prefetch(tf_data.AUTOTUNE).cache()
+
+# Crear los datasets
+train_ds = make_dataset(train_pairs)
+val_ds = make_dataset(val_pairs)
+
+
+train_ds = make_dataset(train_pairs)
+val_ds = make_dataset(val_pairs)
+
+# Construcción del modelo
+encoder_inputs = keras.Input(shape=(MAX_SEQUENCE_LENGTH,), dtype="int64", name="encoder_inputs")
+
+src_embeddings = keras_nlp.layers.TokenAndPositionEmbedding(
+    vocabulary_size=VOCAB_SIZE,
+    sequence_length=MAX_SEQUENCE_LENGTH,
+    embedding_dim=EMBED_DIM,
+)(encoder_inputs)
+
+encoder_outputs = keras_nlp.layers.TransformerEncoder(
+    intermediate_dim=INTERMEDIATE_DIM, num_heads=NUM_HEADS
+)(inputs=src_embeddings)
+encoder = keras.Model(encoder_inputs, encoder_outputs)
+
+decoder_inputs = keras.Input(shape=(MAX_SEQUENCE_LENGTH,), dtype="int64", name="decoder_inputs")
+encoded_seq_inputs = keras.Input(shape=(MAX_SEQUENCE_LENGTH, EMBED_DIM), name="decoder_state_inputs")
+
+tgt_embeddings = keras_nlp.layers.TokenAndPositionEmbedding(
+    vocabulary_size=VOCAB_SIZE,
+    sequence_length=MAX_SEQUENCE_LENGTH,
+    embedding_dim=EMBED_DIM,
+)(decoder_inputs)
+
+decoder_outputs = keras_nlp.layers.TransformerDecoder(
+    intermediate_dim=INTERMEDIATE_DIM, num_heads=NUM_HEADS
+)(decoder_sequence=tgt_embeddings, encoder_sequence=encoded_seq_inputs)
+decoder_outputs = keras.layers.Dropout(0.5)(decoder_outputs)
+decoder_outputs = keras.layers.Dense(VOCAB_SIZE, activation="softmax")(decoder_outputs)
+decoder = keras.Model(
+    [decoder_inputs, encoded_seq_inputs],
+    decoder_outputs,
+)
+decoder_outputs = decoder([decoder_inputs, encoder_outputs])
+
+transformer = keras.Model(
+    [encoder_inputs, decoder_inputs],
+    decoder_outputs,
+    name="transformer",
+)
+
+# Entrenamiento del modelo
+transformer.summary()
+transformer.compile(
+    "rmsprop", loss="sparse_categorical_crossentropy", metrics=["accuracy"]
+)
+transformer.fit(train_ds, epochs=EPOCHS, validation_data=val_ds)
+
+# Función para decodificar frases
+def decode_sequences(input_sentences):
+    batch_size = 1
+    encoder_input_tokens = src_tokenizer(input_sentences)
+    encoder_input_tokens = encoder_input_tokens.to_tensor(default_value=0)
+    encoder_input_tokens = encoder_input_tokens[:, :MAX_SEQUENCE_LENGTH]
+    encoder_input_tokens = ops.pad(encoder_input_tokens, [[0, 0], [0, MAX_SEQUENCE_LENGTH - ops.shape(encoder_input_tokens)[1]]], constant_values=0)
+
+    def next(prompt, cache, index):
+        logits = transformer([encoder_input_tokens, prompt])[:, index - 1, :]
+        hidden_states = None
+        return logits, hidden_states, cache
+
+    length = MAX_SEQUENCE_LENGTH
+    start = ops.full((batch_size, 1), tgt_tokenizer.token_to_id("[START]"))
+    pad = ops.full((batch_size, length - 1), tgt_tokenizer.token_to_id("[PAD]"))
+    prompt = ops.concatenate((start, pad), axis=-1)
+
+    generated_tokens = keras_nlp.samplers.GreedySampler()(
+        next,
+        prompt,
+        stop_token_ids=[tgt_tokenizer.token_to_id("[END]")],
+        index=1,
+    )
+    generated_sentences = tgt_tokenizer.detokenize(generated_tokens)
+    return generated_sentences
+
+# Evaluación del modelo
+rouge_1 = keras_nlp.metrics.RougeN(order=1)
+rouge_2 = keras_nlp.metrics.RougeN(order=2)
+
+for test_pair in test_pairs[:30]:
+    input_sentence = test_pair[0]
+    reference_sentence = test_pair[1]
+
+    translated_sentence = decode_sequences([input_sentence])
+    translated_sentence = translated_sentence.numpy()[0].decode("utf-8")
+    translated_sentence = (
+        translated_sentence.replace("[PAD]", "")
+        .replace("[START]", "")
+        .replace("[END]", "")
+        .strip()
+    )
+
+    rouge_1(reference_sentence, translated_sentence)
+    rouge_2(reference_sentence, translated_sentence)
+
+print("ROUGE-1 Score: ", rouge_1.result())
+print("ROUGE-2 Score: ", rouge_2.result())
+
+#Función para ver la decodificación de las oracioesn indigenas a español
+
+import random
+
+
+def decode_sequences(input_sentences):
+    batch_size = 1
+
+    
+    encoder_input_tokens = src_tokenizer(input_sentences).to_tensor(default_value=0)
+    encoder_input_tokens = ops.pad(
+        encoder_input_tokens,
+        [[0, 0], [0, MAX_SEQUENCE_LENGTH - ops.shape(encoder_input_tokens)[1]]],
+        constant_values=0
+    )
+
+    
+    def next(prompt, cache, index):
+        logits = transformer([encoder_input_tokens, prompt])[:, index - 1, :]
+        hidden_states = None
+        return logits, hidden_states, cache
+
+    
+    length = MAX_SEQUENCE_LENGTH
+    start = ops.full((batch_size, 1), tgt_tokenizer.token_to_id("[START]"))
+    pad = ops.full((batch_size, length - 1), tgt_tokenizer.token_to_id("[PAD]"))
+    prompt = ops.concatenate((start, pad), axis=-1)
+
+    generated_tokens = keras_nlp.samplers.GreedySampler()(
+        next,
+        prompt,
+        stop_token_ids=[tgt_tokenizer.token_to_id("[END]")],
+        index=1,
+    )
+    generated_sentences = tgt_tokenizer.detokenize(generated_tokens)
+    return generated_sentences
+
+# Análisis cualitativo de las traducciones
+test_texts = [pair[0] for pair in test_pairs]
+for i in range(2):  # Puedes ajustar la cantidad de ejemplos que quieres mostrar
+    input_sentence = random.choice(test_texts)
+    translated = decode_sequences([input_sentence])
+    translated = translated.numpy()[0].decode("utf-8")
+    translated = (
+        translated.replace("[PAD]", "")
+        .replace("[START]", "")
+        .replace("[END]", "")
+        .strip()
+    )
+    print(f"** Example {i} **")
+    print("Input:", input_sentence)
+    print("Translated:", translated)
+    print()
